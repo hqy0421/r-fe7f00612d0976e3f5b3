@@ -1,0 +1,316 @@
+#' Detect if OS is Windows
+#' @noRd
+os_is_windows <- function() {
+  checkmate::test_os("windows")
+}
+
+#' More stable version of `log(mean(exp(x)))`
+#'
+#' @noRd
+#' @param x A numeric vector.
+#' @return A scalar equal to `log(mean(exp(x)))`.
+#'
+logMeanExp <- function(x) {
+  logS <- log(length(x))
+  matrixStats::logSumExp(x) - logS
+}
+
+#' More stable version of `log(colMeans(exp(x)))`
+#'
+#' @noRd
+#' @param x A matrix.
+#' @return A vector where each element is `logMeanExp()` of a column of `x`.
+#'
+colLogMeanExps <- function(x) {
+  logS <- log(nrow(x))
+  matrixStats::colLogSumExps(x) - logS
+}
+
+#' More stable version of `exp(x) - exp(y)`
+#'
+#' @noRd
+#' @param x A numeric vector.
+#' @param y A numeric scalar or vector recycled to the length of `x`.
+#'   Must satisfy `x >= y` elementwise.
+#' @return A numeric vector equal to `exp(x) - exp(y)`.
+#'
+exp_x_minus_exp_y <- function(x, y) {
+  out <- -exp(x) * expm1(y - x)
+  # which() drops the NA comparisons that NA or NaN inputs would produce
+  out[which(x == y)] <- 0
+  out
+}
+
+#' More stable version of `x^2 - y^2`
+#'
+#' @noRd
+#' @param x,y Numeric vectors of the same length.
+#' @return A numeric vector equal to `x^2 - y^2`.
+#'
+difference_of_squares <- function(x, y) {
+  (x - y) * (x + y)
+}
+
+#' More stable version of `(exp(a) - exp(b)) / exp(c)`
+#'
+#' @noRd
+#' @param a,b,c Numeric vectors of the same length.
+#' @return A numeric vector equal to `(exp(a) - exp(b)) / exp(c)`. Elements
+#'   with `a == b` are returned as an exact zero regardless of `c`; elsewhere
+#'   `NA` and `NaN` inputs propagate.
+#'
+exp_diff_over_exp <- function(a, b, c) {
+  # `a >= b` is NA if `a` or `b` is NA or NaN, and R silently ignores NA
+  # indices in `[<-`. Seed the result from the inputs and index with which()
+  # so that missing values propagate instead of leaving a zero behind.
+  out <- a + b + c
+  larger <- which(a >= b)
+  smaller <- which(a < b)
+  out[larger] <- exp(a[larger] - c[larger]) * -expm1(b[larger] - a[larger])
+  out[smaller] <- exp(b[smaller] - c[smaller]) * expm1(a[smaller] - b[smaller])
+  out[which(a == b)] <- 0
+  out
+}
+
+#' Compute point estimates and standard errors from pointwise vectors
+#'
+#' @noRd
+#' @param x A matrix.
+#' @return An `ncol(x)` by 2 matrix with columns `"Estimate"` and `"SE"`
+#'   and rownames equal to `colnames(x)`.
+#'
+table_of_estimates <- function(x) {
+  out <- cbind(
+    Estimate = matrixStats::colSums2(x),
+    SE = sqrt(nrow(x) * matrixStats::colVars(x))
+  )
+  rownames(out) <- colnames(x)
+  return(out)
+}
+
+
+# validating and reshaping arrays/matrices  -------------------------------
+
+#' Check for `NA` and non-finite values in log-lik (or log-ratios)
+#' array/matrix/vector
+#'
+#' @noRd
+#' @param x Array/matrix/vector of log-likelihood or log-ratio values.
+#' @return `x`, invisibly, if no error is thrown.
+#'
+validate_ll <- function(x) {
+  if (is.list(x)) {
+    stop("List not allowed as input.")
+  } else if (anyNA(x)) {
+    stop("NAs not allowed in input.")
+  } else if (any(x == Inf)) {
+    stop("All input values must be finite or -Inf.")
+  }
+  invisible(x)
+}
+
+#' Check that a log-likelihood array/matrix/vector is finite
+#'
+#' `loo()` requires finite log-likelihood values, for two unrelated reasons.
+#'
+#' A `-Inf` log likelihood is meaningful on its own — the observation has zero
+#' likelihood under that draw — but the leave-one-out importance ratio is
+#' `1 / p(y_i | theta)`, which is then infinite, so the PSIS estimate does not
+#' exist. Because `loo()` negates the log likelihood before importance
+#' sampling, this used to surface as [validate_ll()]'s `+Inf` message, with the
+#' polarity reversed.
+#'
+#' A `+Inf` log likelihood is not meaningful, and it passes the log-ratio check
+#' as a `-Inf` ratio. `ll + lw` is then `Inf + -Inf`, so a single such value
+#' made every estimate for the model `NA`.
+#'
+#' This is deliberately stricter than [validate_ll()], which is also used for
+#' log ratios, where `-Inf` is a valid zero importance weight.
+#'
+#' @noRd
+#' @param x Array/matrix/vector of log-likelihood values.
+#' @return `x`, invisibly, if no error is thrown.
+#'
+validate_log_lik <- function(x) {
+  if (is.list(x)) {
+    stop("List not allowed as input.")
+  }
+  # single pass covering NA, NaN and both infinities; the more specific checks
+  # below only run when something is already known to be wrong
+  if (!all(is.finite(x))) {
+    if (anyNA(x)) {
+      stop("NAs not allowed in input.")
+    }
+    stop("All log-likelihood values must be finite.")
+  }
+  invisible(x)
+}
+
+#' Convert iter by chain by obs array to (iter * chain) by obs matrix
+#'
+#' @noRd
+#' @param x Array to convert.
+#' @return An (iter * chain) by obs matrix.
+#'
+llarray_to_matrix <- function(x) {
+  stopifnot(is.array(x), length(dim(x)) == 3)
+  xdim <- dim(x)
+  dim(x) <- c(prod(xdim[1:2]), xdim[3])
+  unname(x)
+}
+
+#' Convert (iter * chain) by obs matrix to iter by chain by obs array
+#'
+#' @noRd
+#' @param x matrix to convert.
+#' @param chain_id vector of chain ids.
+#' @return iter by chain by obs array
+#'
+llmatrix_to_array <- function(x, chain_id) {
+  stopifnot(is.matrix(x), all(chain_id == as.integer(chain_id)))
+
+  lldim <- dim(x)
+  n_chain <- length(unique(chain_id))
+  chain_id <- as.integer(chain_id)
+  chain_counts <- as.numeric(table(chain_id))
+
+  if (length(chain_id) != lldim[1]) {
+    stop("Number of rows in matrix not equal to length(chain_id).",
+         call. = FALSE)
+  } else if (any(chain_counts != chain_counts[1])) {
+    stop("Not all chains have same number of iterations.",
+         call. = FALSE)
+  } else if (max(chain_id) != n_chain) {
+    stop("max(chain_id) not equal to the number of chains.",
+         call. = FALSE)
+  }
+
+  n_iter <- lldim[1] / n_chain
+  n_obs <- lldim[2]
+  a <- array(data = NA, dim = c(n_iter, n_chain, n_obs))
+  for (c in seq_len(n_chain)) {
+    a[, c, ] <- x[chain_id == c, , drop = FALSE]
+  }
+  return(a)
+}
+
+
+#' Validate that log-lik function exists and has correct arg names
+#'
+#' @noRd
+#' @param x A function with arguments `data_i` and `draws`.
+#' @return Either returns `x` or throws an error.
+#'
+validate_llfun <- function(x) {
+  f <- match.fun(x)
+  must_have <- c("data_i", "draws")
+  arg_names <- names(formals(f))
+  if (!all(must_have %in% arg_names)) {
+    stop(
+      "Log-likelihood function must have at least the arguments ",
+      "'data_i' and 'draws'",
+      call. = FALSE
+    )
+  }
+  return(f)
+}
+
+
+#' Named lists
+#'
+#' Create a named list using specified names or, if names are omitted, using the
+#' names of the objects in the list. The code `list(a = a, b = b)` becomes
+#' `nlist(a,b)` and `list(a = a, b = 2)` becomes `nlist(a, b = 2)`, etc.
+#'
+#' @export
+#' @keywords internal
+#' @param ... Objects to include in the list.
+#' @return A named list.
+#' @examples
+#'
+#' # All variables already defined
+#' a <- rnorm(100)
+#' b <- mat.or.vec(10, 3)
+#' nlist(a,b)
+#'
+#' # Define some variables in the call and take the rest from the environment
+#' nlist(a, b, veggies = c("lettuce", "spinach"), fruits = c("banana", "papaya"))
+#'
+nlist <- function(...) {
+  m <- match.call()
+  out <- list(...)
+  no_names <- is.null(names(out))
+  has_name <- if (no_names) FALSE else nzchar(names(out))
+  if (all(has_name))
+    return(out)
+  nms <- as.character(m)[-1L]
+  if (no_names) {
+    names(out) <- nms
+  } else {
+    names(out)[!has_name] <- nms[!has_name]
+  }
+
+  return(out)
+}
+
+
+# Check how many cores to use and throw deprecation warning if loo.cores is used
+loo_cores <- function(cores) {
+  loo_cores_op <- getOption("loo.cores", NA)
+  if (!is.na(loo_cores_op) && (loo_cores_op != cores)) {
+    cores <- loo_cores_op
+    .warn("'loo.cores' is deprecated, please use 'mc.cores' or pass 'cores' explicitly.",
+          class = "loo_warning_deprecated")
+  }
+  return(cores)
+}
+
+
+# nocov start
+# release reminders (for devtools)
+release_questions <- function() {
+  c(
+    "Have you updated references?",
+    "Have you updated inst/CITATION?",
+    "Have you updated the vignettes?"
+  )
+}
+# nocov end
+
+# `x` is constant if `max(x) - min(x)` is at most `tol` times the largest
+# absolute value in `x`. Default is `.Machine$double.eps`.
+is_constant <- function(x, tol = .Machine$double.eps) {
+  r <- range(x)
+  spread <- r[2] - r[1]
+  # the equality check covers all-zero and all-infinite x
+  r[1] == r[2] || (is.finite(spread) && spread <= tol * max(abs(r)))
+}
+
+#' Collect posterior warnings and signal each class once
+#'
+#' @noRd
+#' @param expr Expression to evaluate.
+#' @return The value of `expr`.
+.collect_warnings <- function(expr) {
+  collected <- list()
+  counts <- list()
+  on.exit(for (cls in names(collected)) {
+    cnd <- collected[[cls]]
+    if (counts[[cls]] > 1) {
+      cnd$message <- paste0(cnd$message, " (", counts[[cls]], " times)")
+    }
+    warning(cnd)
+  })
+  withCallingHandlers(
+    expr,
+    posterior_warning = function(cnd) {
+      cls <- class(cnd)[1]
+      if (is.null(collected[[cls]])) {
+        collected[[cls]] <<- cnd
+        counts[[cls]] <<- 0
+      }
+      counts[[cls]] <<- counts[[cls]] + 1
+      invokeRestart("muffleWarning")
+    }
+  )
+}

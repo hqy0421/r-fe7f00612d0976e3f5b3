@@ -1,0 +1,358 @@
+# generate fake data
+set.seed(123)
+y <- rnorm(50, 0, 1)
+sd_sim1 <- abs(rnorm(500, 1.5, 0.1))
+sd_sim2 <- abs(rnorm(500, 1.2, 0.1))
+sd_sim3 <- abs(rnorm(500, 1, 0.05))
+log_lik1 <- log_lik2 <- log_lik3 <- matrix(NA, 500, 50)
+for (s in 1:500) {
+  log_lik1[s, ] <- dnorm(y, -1, sd_sim1[s], log = T)
+  log_lik2[s, ] <- dnorm(y, 0.7, sd_sim2[s], log = T)
+  log_lik3[s, ] <- dnorm(y, 1, sd_sim3[s], log = T)
+}
+
+ll_list <- list(log_lik1, log_lik2, log_lik3)
+r_eff_list <- list(rep(0.9, 50), rep(0.9, 50), rep(0.9, 50))
+
+loo_list <- lapply(1:length(ll_list), function(j) {
+  loo(ll_list[[j]], r_eff = r_eff_list[[j]])
+})
+
+tol <- 0.01 # absolute tolerance of weights
+
+test_that("stacking gradient is stable for similar model predictions", {
+  a <- -30 + 1e-14
+  b <- -30
+
+  expect_equal(exp_diff_over_exp(a, b, b), 1.065814103640156e-14)
+  expect_equal(exp_diff_over_exp(b, a, b), -1.065814103640156e-14)
+  expect_equal(
+    exp_diff_over_exp(c(-Inf, 0, Inf), c(-Inf, 0, Inf), c(0, 0, 0)),
+    c(0, 0, 0)
+  )
+})
+
+test_that("exp_diff_over_exp propagates missing values", {
+  expect_equal(exp_diff_over_exp(NaN, 0, 0), NaN)
+  expect_equal(exp_diff_over_exp(0, NaN, 0), NaN)
+  expect_equal(exp_diff_over_exp(0, -1, NaN), NaN)
+  expect_equal(exp_diff_over_exp(NA_real_, 0, 0), NA_real_)
+  # equal numerators short-circuit to an exact zero, whatever the denominator
+  expect_equal(exp_diff_over_exp(0, 0, NaN), 0)
+  expect_equal(
+    exp_diff_over_exp(c(NaN, 0), c(0, -1), c(0, 0)),
+    c(NaN, exp_diff_over_exp(0, -1, 0))
+  )
+})
+
+test_that("stacking handles equal infinite log predictive densities", {
+  lpd <- matrix(
+    c(-Inf, 0, -Inf, -1, -1, -1),
+    nrow = 2,
+    byrow = TRUE
+  )
+
+  expect_equal(as.numeric(stacking_weights(lpd)), c(0, 1, 0), tolerance = 1e-6)
+})
+
+test_that("loo_model_weights accepts models with different numbers of draws", {
+  ll_short <- list(log_lik1, log_lik2[1:250, ], log_lik3)
+  loo_short <- loo_list
+  loo_short[[2]] <- loo(log_lik2[1:250, ], r_eff = r_eff_list[[2]])
+
+  for (method in c("stacking", "pseudobma")) {
+    w_mat <- loo_model_weights(ll_short, method = method, BB = FALSE,
+                               r_eff_list = r_eff_list)
+    w_loo <- loo_model_weights(loo_short, method = method, BB = FALSE)
+    expect_equal(as.numeric(w_mat), as.numeric(w_loo))
+    expect_true(all(w_loo >= 0))
+    expect_equal(sum(w_loo), 1)
+  }
+})
+
+test_that("loo_model_weights accepts loo_subsample() objects only for pseudo-BMA", {
+  # restore the random number stream, which later tests in this file use
+  old_seed <- .Random.seed
+  on.exit(assign(".Random.seed", old_seed, envir = globalenv()), add = TRUE)
+  set.seed(409)
+  N <- 200
+  dat <- data.frame(y = rbinom(N, size = 10, prob = 0.7), K = 10)
+  llfun <- function(data_i, draws) {
+    dbinom(data_i$y, size = data_i$K, prob = draws, log = TRUE)
+  }
+  post1 <- as.matrix(rbeta(500, 140, 60))
+  post2 <- as.matrix(rbeta(500, 30, 20))
+  # the worse model gives high Pareto k values and a warning
+  ss <- function(post, observations, data = dat) {
+    suppressWarnings(loo_subsample(llfun, draws = post, data = data,
+                                   observations = observations,
+                                   loo_approximation = "plpd",
+                                   r_eff = rep(1, nrow(data))))
+  }
+  # different subsamples of different sizes
+  loo_ss1 <- ss(post1, 50)
+  loo_ss2 <- ss(post2, 80)
+  expect_false(setequal(obs_idx(loo_ss1), obs_idx(loo_ss2)))
+  loo_full <- suppressWarnings(loo(llfun, draws = post1, data = dat, r_eff = rep(1, N)))
+  error <- "supports objects from loo_subsample() only with method = \"pseudobma\" and BB = FALSE"
+
+  # stacking and pseudo-BMA+ need pointwise values for all observations
+  expect_error(loo_model_weights(list(loo_ss1, loo_ss2)), error, fixed = TRUE)
+  expect_error(loo_model_weights(list(loo_ss1, loo_ss2), BB = FALSE), error,
+               fixed = TRUE)
+  expect_error(loo_model_weights(list(loo_full, loo_ss2)), error, fixed = TRUE)
+  expect_error(
+    loo_model_weights(list(loo_ss1, loo_ss2), method = "pseudobma"),
+    error,
+    fixed = TRUE
+  )
+
+  # pseudo-BMA uses the subsampling estimates of elpd_loo
+  elpd <- c(loo_ss1$estimates["elpd_loo", "Estimate"],
+            loo_ss2$estimates["elpd_loo", "Estimate"])
+  w <- loo_model_weights(list(a = loo_ss1, b = loo_ss2), method = "pseudobma",
+                         BB = FALSE)
+  expect_s3_class(w, "pseudobma_weights")
+  expect_named(w, c("a", "b"))
+  expect_equal(as.numeric(w), exp(elpd - max(elpd)) / sum(exp(elpd - max(elpd))))
+
+  # a full loo object and a subsampled object can be combined
+  w2 <- loo_model_weights(list(loo_full, loo_ss2), method = "pseudobma", BB = FALSE)
+  elpd2 <- c(loo_full$estimates["elpd_loo", "Estimate"], elpd[2])
+  expect_equal(as.numeric(w2), exp(elpd2 - max(elpd2)) / sum(exp(elpd2 - max(elpd2))))
+
+  # the models must still have the same number of observations
+  loo_ss_short <- ss(post2, 50, data = dat[1:150, ])
+  expect_error(
+    loo_model_weights(list(loo_ss1, loo_ss_short), method = "pseudobma", BB = FALSE),
+    "same number of observations"
+  )
+})
+
+test_that("pseudo-BMA weights from elpd estimates reject NA and Inf", {
+  error <- "All elpd_loo estimates must be finite or -Inf."
+  expect_error(pseudobma_weights_from_elpd(c(-10, NA)), error, fixed = TRUE)
+  expect_error(pseudobma_weights_from_elpd(c(-10, NaN)), error, fixed = TRUE)
+  expect_error(pseudobma_weights_from_elpd(c(-10, Inf)), error, fixed = TRUE)
+  expect_error(
+    pseudobma_weights_from_elpd(c(-Inf, -Inf)),
+    "At least one model must have a finite total predictive density."
+  )
+  expect_equal(as.numeric(pseudobma_weights_from_elpd(c(-10, -Inf))), c(1, 0))
+})
+
+test_that("loo_model_weights throws correct errors and warnings", {
+  expect_error(
+    loo_model_weights(log_lik1),
+    "list of matrices or a list of 'psis_loo' objects"
+  )
+  expect_error(loo_model_weights(list(log_lik1)), "At least two models")
+  expect_error(loo_model_weights(list(loo_list[[1]])), "At least two models")
+  expect_error(
+    loo_model_weights(list(log_lik1), method = "pseudobma"),
+    "At least two models"
+  )
+
+  expect_error(
+    loo_model_weights(list(log_lik1, log_lik2, log_lik3[, -1])),
+    "same number of observations"
+  )
+
+  loo_list2 <- loo_list
+  loo_list2[[3]] <- loo(log_lik3[, -1], r_eff = rep(0.9, 49))
+  expect_error(loo_model_weights(loo_list2), "same number of observations")
+
+  expect_error(
+    loo_model_weights(ll_list, r_eff_list = r_eff_list[-1]),
+    "one component for each model"
+  )
+
+  r_eff_list[[3]] <- rep(0.9, 51)
+  expect_error(
+    loo_model_weights(ll_list, r_eff_list = r_eff_list),
+    "same length as the number of columns"
+  )
+
+  expect_error(
+    loo_model_weights(list(loo_list[[1]], 2)),
+    "List elements must all be 'psis_loo' objects or log-likelihood matrices",
+    fixed = TRUE
+  )
+
+  expect_no_warning(loo_model_weights(ll_list))
+})
+
+
+test_that("loo_model_weights (stacking and pseudo-BMA) gives expected result", {
+  w1 <- loo_model_weights(ll_list, method = "stacking", r_eff_list = r_eff_list)
+  expect_type(w1, "double")
+  expect_s3_class(w1, "stacking_weights")
+  expect_length(w1, 3)
+  expect_named(w1, paste0("model", c(1:3)))
+  expect_snapshot_value(as.numeric(w1), style = "serialize")
+  expect_snapshot(print(w1))
+
+  w1_b <- loo_model_weights(loo_list)
+  expect_identical(w1, w1_b)
+
+  w2 <- loo_model_weights(
+    ll_list,
+    r_eff_list = r_eff_list,
+    method = "pseudobma",
+    BB = TRUE
+  )
+  expect_type(w2, "double")
+  expect_s3_class(w2, "pseudobma_bb_weights")
+  expect_length(w2, 3)
+  expect_named(w2, paste0("model", c(1:3)))
+  expect_snapshot_value(as.numeric(w2), style = "serialize")
+  expect_snapshot(print(w2))
+
+  w3 <- loo_model_weights(
+    ll_list,
+    r_eff_list = r_eff_list,
+    method = "pseudobma",
+    BB = FALSE
+  )
+  expect_type(w3, "double")
+  expect_length(w3, 3)
+  expect_named(w3, paste0("model", c(1:3)))
+  expect_equal(
+    as.numeric(w3),
+    c(5.365279e-05, 9.999436e-01, 2.707028e-06),
+    tolerance = tol
+  )
+  expect_snapshot(print(w3))
+
+  w3_b <- loo_model_weights(loo_list, method = "pseudobma", BB = FALSE)
+  expect_identical(w3, w3_b)
+})
+
+test_that("stacking_weights gives expected result", {
+  set.seed(10)
+  lpd_point <- matrix(rnorm(2000, -1), 400, 5)
+
+  actual <- stacking_weights(lpd_point)
+
+  expect_s3_class(actual, "stacking_weights")
+  expect_named(actual, paste0("model", 1:5))
+  expect_equal(sum(actual), 1)
+  expect_equal(
+    as.numeric(actual),
+    c(0.158382400055713, 0.176065699214342, 0.19918082992972,
+      0.264490615659226, 0.201880455141),
+    tolerance = 1e-6
+  )
+})
+
+test_that("Bayesian bootstrap gives expected result", {
+  lpd_point <- rbind(
+    c(-0.2, -0.8, -1.1),
+    c(-1.4, -0.3, -0.5),
+    c(-0.6, -0.7, -0.1),
+    c(-1.0, -1.2, -0.4),
+    c(-0.9, -0.5, -0.8)
+  )
+  BB_n <- 25
+  alpha <- 0.7
+
+  set.seed(0)
+  weights <- pseudobma_weights(lpd_point, BB = TRUE, BB_n = BB_n, alpha = alpha)
+
+  expect_s3_class(weights, "pseudobma_bb_weights")
+  expect_named(weights, paste0("model", 1:3))
+  expect_equal(sum(weights), 1)
+  expect_snapshot_value(
+    unname(as.numeric(weights)),
+    style = "deparse"
+  )
+
+  # Compare to a reference loop over the same Bayesian bootstrap draws
+  set.seed(0)
+  BB_weighting <- dirichlet_rng(BB_n, rep(alpha, nrow(lpd_point)))
+  expected <- matrix(NA, BB_n, ncol(lpd_point))
+  for (bb in 1:BB_n) {
+    z_bb <- BB_weighting[bb, ] %*% lpd_point * nrow(lpd_point)
+    uwts <- exp(z_bb - max(z_bb))
+    expected[bb, ] <- uwts / sum(uwts)
+  }
+  expect_equal(as.numeric(weights), colMeans(expected))
+})
+
+test_that("pseudo-BMA gives zero weight to an impossible model", {
+  lpd <- cbind(rep(-Inf, 3), c(-2, -1, 0))
+
+  expect_equal(as.numeric(pseudobma_weights(lpd, BB = FALSE)), c(0, 1))
+})
+
+lpd_bad_values <- list(`NA` = NA_real_, `NaN` = NaN, `Inf` = Inf)
+
+# One test_that() per value, so a failure names which one broke
+for (lpd_bad_name in names(lpd_bad_values)) {
+  test_that(paste("model weighting rejects", lpd_bad_name, "predictive densities"), {
+    bad <- lpd_bad_values[[lpd_bad_name]]
+    set.seed(1)
+    lpd <- cbind(rnorm(20, -2), rnorm(20, -2.2))
+    error <- "All values in 'lpd_point' must be finite or -Inf."
+
+    single <- lpd
+    single[3, 2] <- bad
+    expect_error(stacking_weights(single), error, fixed = TRUE)
+    expect_error(pseudobma_weights(single, BB = FALSE), error, fixed = TRUE)
+    expect_error(pseudobma_weights(single, BB = TRUE), error, fixed = TRUE)
+
+    whole_column <- lpd
+    whole_column[, 2] <- bad
+    expect_error(stacking_weights(whole_column), error, fixed = TRUE)
+    expect_error(pseudobma_weights(whole_column, BB = FALSE), error, fixed = TRUE)
+  })
+}
+
+test_that("model weighting still accepts -Inf predictive densities", {
+  set.seed(1)
+  lpd <- cbind(rnorm(20, -2), rnorm(20, -2.2))
+  lpd[3, 2] <- -Inf
+
+  expect_no_error(stacking_weights(lpd))
+  expect_no_error(pseudobma_weights(lpd, BB = FALSE))
+  expect_no_error(pseudobma_weights(lpd, BB = TRUE))
+})
+
+test_that("model weighting rejects inputs with no finite predictive density", {
+  stacking_lpd <- rbind(c(-Inf, -Inf), c(-1, -1))
+  expect_error(
+    stacking_weights(stacking_lpd),
+    "Each observation must have a finite predictive density for at least one model.",
+    fixed = TRUE
+  )
+
+  pseudobma_lpd <- matrix(-Inf, nrow = 2, ncol = 2)
+  error <- "At least one model must have a finite total predictive density."
+  expect_error(pseudobma_weights(pseudobma_lpd, BB = FALSE), error, fixed = TRUE)
+  expect_error(pseudobma_weights(pseudobma_lpd, BB = TRUE), error, fixed = TRUE)
+})
+
+test_that("stacking_weights and pseudobma_weights throw correct errors", {
+  xx <- cbind(rnorm(10))
+  expect_error(stacking_weights(xx), "two models are required")
+  expect_error(pseudobma_weights(xx), "two models are required")
+})
+
+test_that("loo_model_weights uses correct names for list of loo objects", {
+  loo1 <- loo_list[[1]]
+  loo2 <- loo_list[[2]]
+  loo3 <- loo_list[[3]]
+
+  expect_named(
+    loo_model_weights(list(loo1, loo2, loo3)),
+    c("model1", "model2", "model3")
+  )
+  expect_named(
+    loo_model_weights(list("a" = loo1, loo2, "c" = loo3)),
+    c("a", "model2", "c")
+  )
+  expect_named(
+    loo_model_weights(list(`a` = loo1, `b` = loo2, `c` = loo3)),
+    c("a", "b", "c")
+  )
+})

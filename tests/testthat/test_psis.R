@@ -1,0 +1,200 @@
+options(mc.cores = 1)
+options(loo.cores = NULL)
+set.seed(123)
+
+LLarr <- example_loglik_array()
+LLmat <- example_loglik_matrix()
+LLvec <- LLmat[, 1]
+chain_id <- rep(1:2, each = dim(LLarr)[1])
+r_eff_arr <- relative_eff(exp(LLarr))
+r_eff_vec <- relative_eff(exp(LLvec), chain_id = chain_id)
+psis1 <- psis(log_ratios = -LLarr, r_eff = r_eff_arr)
+
+test_that("psis results haven't changed", {
+  expect_snapshot_value(psis1, style = "serialize")
+})
+
+test_that("psis returns object with correct structure", {
+  expect_true(is.psis(psis1))
+  expect_false(is.loo(psis1))
+  expect_false(is.psis_loo(psis1))
+
+  expect_named(psis1, c("log_weights", "diagnostics"))
+  expect_named(psis1$diagnostics, c("pareto_k", "n_eff", "r_eff"))
+  expect_equal(dim(psis1), dim(LLmat))
+  expect_length(psis1$diagnostics$pareto_k, dim(psis1)[2])
+  expect_length(psis1$diagnostics$n_eff, dim(psis1)[2])
+})
+
+
+test_that("psis methods give same results", {
+  psis2 <- suppressWarnings(psis(-LLmat, r_eff = r_eff_arr))
+  expect_identical(psis1, psis2)
+
+  psisvec <- suppressWarnings(psis(-LLvec, r_eff = r_eff_vec))
+  psismat <- suppressWarnings(psis(-LLmat[, 1], r_eff = r_eff_vec))
+  expect_identical(psisvec, psismat)
+})
+
+test_that("psis throws correct errors and warnings", {
+  # r_eff default no warnings
+  expect_no_warning(psis(-LLarr))
+  expect_no_warning(psis(-LLmat))
+  expect_no_warning(psis(-LLmat[, 1]))
+
+  # r_eff=NULL no warnings
+  expect_silent(psis(-LLarr, r_eff = NULL))
+  expect_silent(psis(-LLmat, r_eff = NULL))
+  expect_silent(psis(-LLmat[, 1], r_eff = NULL))
+
+  # r_eff=NA disables warnings
+  expect_silent(psis(-LLarr, r_eff = NA))
+  expect_silent(psis(-LLmat, r_eff = NA))
+  expect_silent(psis(-LLmat[, 1], r_eff = NA))
+
+  # r_eff default and r_eff=NA give same answer
+  expect_equal(
+    suppressWarnings(psis(-LLarr)),
+    psis(-LLarr, r_eff = NA)
+  )
+
+  # r_eff=NULL and r_eff=NA give same answer
+  expect_equal(
+    suppressWarnings(psis(-LLarr, r_eff = NULL)),
+    psis(-LLarr, r_eff = NA)
+  )
+
+  # r_eff scalar is fine
+  expect_silent(psis(-LLarr, r_eff = r_eff_arr[1]))
+
+  # r_eff non-scalar wrong length is error
+  expect_error(psis(-LLarr, r_eff = r_eff_arr[-1]), "one value per observation")
+
+  # r_eff has some NA values which are replaced with 1
+  r_eff_arr[2] <- NA
+  expect_snapshot(psis(-LLarr, r_eff = r_eff_arr))
+
+  # tail length warnings
+  expect_snapshot(psis(-LLarr[1:5, , ]))
+
+  # no NAs or non-finite values allowed
+  LLmat[1, 1] <- NA
+  expect_error(psis(-LLmat), "NAs not allowed in input")
+
+  LLmat[1, 1] <- 1
+  LLmat[10, 2] <- -Inf
+  expect_error(psis(-LLmat), "All input values must be finite or -Inf")
+  # log ratio of -Inf is allowed
+  LLmat[10, 2] <- Inf
+  expect_no_error(psis(-LLmat))
+
+  # no lists allowed
+  expect_error(
+    expect_warning(psis(as.list(-LLvec))),
+    "List not allowed as input"
+  )
+
+  # if array, must be 3-D array
+  dim(LLarr) <- c(2, 250, 2, 32)
+  expect_error(
+    psis(-LLarr),
+    "length(dim(log_ratios)) == 3 is not TRUE",
+    fixed = TRUE
+  )
+})
+
+test_that("throw_tail_length_warnings gives correct output", {
+  expect_silent(throw_tail_length_warnings(10))
+  expect_equal(throw_tail_length_warnings(10), 10)
+  expect_warning(throw_tail_length_warnings(1), "Not enough tail samples")
+  expect_warning(
+    throw_tail_length_warnings(c(1, 10, 2)),
+    "Skipping the following columns: 1, 3"
+  )
+  expect_warning(throw_tail_length_warnings(rep(1, 21)), "11 more not printed")
+})
+
+
+test_that("weights method returns correct output", {
+  # default arguments
+  expect_identical(weights(psis1), weights(psis1, normalize = TRUE, log = TRUE))
+
+  # unnormalized log-weights same as in psis object
+  expect_equal(psis1$log_weights, weights(psis1, normalize = FALSE))
+
+  # normalized weights sum to 1
+  expect_equal(
+    colSums(weights(psis1, normalize = TRUE, log = FALSE)),
+    rep(1, ncol(psis1$log_weights))
+  )
+})
+
+
+test_that("psis_n_eff methods works properly", {
+  w <- weights(psis1, normalize = TRUE, log = FALSE)
+  expect_equal(psis_n_eff.default(w[, 1], r_eff = 1), 1 / sum(w[, 1]^2))
+  expect_equal(psis_n_eff.default(w[, 1], r_eff = 2), 2 / sum(w[, 1]^2))
+  expect_equal(
+    psis_n_eff.default(w[, 1], r_eff = 2),
+    psis_n_eff.matrix(w, r_eff = rep(2, ncol(w)))[1]
+  )
+  expect_no_warning(psis_n_eff.default(w[, 1]))
+  expect_no_warning(psis_n_eff.matrix(w))
+})
+
+
+test_that("do_psis_i throws warning if all tail values the same", {
+  xx <- c(1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4)
+  expect_warning(
+    val <- do_psis_i(xx, tail_len_i = 6),
+    "all tail values are the same"
+  )
+  expect_equal(val$pareto_k, Inf)
+})
+
+test_that("psis handles negative infinite log ratios", {
+  log_ratios <- c(rep(-Inf, 90), seq(-9, 0, length.out = 10))
+
+  expect_no_error(out <- suppressWarnings(psis(log_ratios)))
+  expect_s3_class(out, "psis")
+})
+
+test_that("exp_x_minus_exp_y is stable for nearby values", {
+  cutoff <- -30
+  x <- cutoff + 1e-14
+
+  expect_equal(exp_x_minus_exp_y(x, cutoff), 9.973486536736925e-28)
+  expect_equal(exp_x_minus_exp_y(0, -1000), 1)
+  expect_equal(
+    exp_x_minus_exp_y(c(-Inf, 0, Inf), c(-Inf, 0, Inf)),
+    c(0, 0, 0)
+  )
+})
+
+test_that("psis_smooth_tail returns original tail values if k is infinite", {
+  xx <- log(c(2, 2, 2, 2, 3, 4, 5, 6))
+  val <- suppressWarnings(psis_smooth_tail(xx, 0))
+  expect_equal(val$tail, xx)
+  expect_equal(val$k, Inf)
+})
+
+test_that("do_psis_i selects the same tail as a full sort, also with ties", {
+  # reference: the tail from a full sort, as in loo 2.10.1
+  do_psis_i_full_sort <- function(log_ratios_i, tail_len_i) {
+    S <- length(log_ratios_i)
+    lw_i <- log_ratios_i - max(log_ratios_i)
+    ord <- sort.int(lw_i, index.return = TRUE)
+    tail_ids <- seq(S - tail_len_i + 1, S)
+    smoothed <- psis_smooth_tail(ord$x[tail_ids], ord$x[min(tail_ids) - 1])
+    lw_i[ord$ix[tail_ids]] <- smoothed$tail
+    lw_i[lw_i > 0] <- 0
+    list(log_weights = lw_i + max(log_ratios_i), pareto_k = smoothed$k)
+  }
+  set.seed(260)
+  # rounding gives many ties, also at the cutoff
+  for (x in list(round(rnorm(4000), 1), round(rt(1000, df = 2), 2))) {
+    tail_len <- n_pareto(1, length(x))
+    expect_identical(do_psis_i(x, tail_len), do_psis_i_full_sort(x, tail_len))
+  }
+})
+

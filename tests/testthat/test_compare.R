@@ -1,0 +1,226 @@
+set.seed(123)
+
+LLarr <- example_loglik_array()
+LLarr2 <- array(rnorm(prod(dim(LLarr)), c(LLarr), 0.5), dim = dim(LLarr))
+LLarr3 <- array(rnorm(prod(dim(LLarr)), c(LLarr), 1), dim = dim(LLarr))
+w1 <- suppressWarnings(waic(LLarr))
+w2 <- suppressWarnings(waic(LLarr2))
+
+test_that("loo_compare throws appropriate errors", {
+  w3 <- suppressWarnings(waic(LLarr[,, -1]))
+  w4 <- suppressWarnings(waic(LLarr[,, -(1:2)]))
+
+  expect_error(loo_compare(2, 3), "must be a list if not a 'loo' object")
+  expect_error(
+    loo_compare(w1, w2, x = list(w1, w2)),
+    "If 'x' is a list then '...' should not be specified"
+  )
+  expect_error(loo_compare(w1, list(1, 2, 3)), "class 'loo'")
+  expect_error(loo_compare(w1), "requires at least two models")
+  expect_error(loo_compare(x = list(w1)), "requires at least two models")
+  expect_error(
+    loo_compare(w1, w3),
+    "All models must have the same number of observations, but models have inconsistent observation counts: 'model1' (32), 'model2' (31)",
+    fixed = TRUE
+  )
+  expect_error(
+    loo_compare(w1, w2, w3),
+    "All models must have the same number of observations, but models have inconsistent observation counts: 'model1' (32), 'model2' (32), 'model3' (31)",
+    fixed = TRUE
+  )
+  expect_error(
+    loo_compare(x = list("Model A" = w1, "Model B" = w2, "Model C" = w3)),
+    "All models must have the same number of observations, but models have inconsistent observation counts: 'Model A' (32), 'Model B' (32), 'Model C' (31)",
+    fixed = TRUE
+  )
+})
+
+test_that("loo_compare throws appropriate warnings", {
+  w3 <- w1
+  w4 <- w2
+  class(w3) <- class(w4) <- c("kfold", "loo")
+  attr(w3, "K") <- 2
+  attr(w4, "K") <- 3
+  expect_warning(
+    loo_compare(w3, w4),
+    "Not all kfold objects have the same K value"
+  )
+
+  class(w4) <- c("psis_loo", "loo")
+  attr(w4, "K") <- NULL
+  expect_warning(loo_compare(w3, w4), "Comparing LOO-CV to K-fold-CV")
+
+  w3 <- w1
+  w4 <- w2
+  attr(w3, "yhash") <- "a"
+  attr(w4, "yhash") <- "b"
+  expect_warning(loo_compare(w3, w4), "Not all models have the same y variable")
+
+  set.seed(123)
+  w_list <- lapply(1:25, function(x) {
+    suppressWarnings(waic(LLarr + rnorm(1, 0, 0.1)))
+  })
+  expect_warning(
+    loo_compare(w_list),
+    "Difference in performance potentially due to chance. See McLatchie and Vehtari (2023) for details.",
+    fixed = TRUE
+  )
+
+  w_list_short <- lapply(1:4, function(x) {
+    suppressWarnings(waic(LLarr + rnorm(1, 0, 0.1)))
+  })
+  expect_no_warning(loo_compare(w_list_short))
+})
+
+
+comp_colnames <- c(
+  "model",
+  "elpd_diff",
+  "se_diff",
+  "p_worse",
+  "diag_diff",
+  "diag_elpd",
+  "elpd_waic",
+  "se_elpd_waic",
+  "p_waic",
+  "se_p_waic",
+  "waic",
+  "se_waic"
+)
+
+test_that("loo_compare returns expected results (2 models)", {
+  comp1 <- loo_compare(w1, w1)
+  expect_s3_class(comp1, "compare.loo")
+  expect_s3_class(comp1, "data.frame")
+  expect_equal(colnames(comp1), comp_colnames)
+  expect_equal(comp1$model, c("model1", "model2"))
+  expect_equal(comp1$elpd_diff, c(0, 0), ignore_attr = TRUE)
+  expect_equal(comp1$se_diff, c(0, 0), ignore_attr = TRUE)
+  expect_equal(comp1$p_worse, c(NA_real_, NA_real_), ignore_attr = TRUE)
+  expect_snapshot_value(comp1, style = "serialize")
+  expect_snapshot(print(comp1))
+
+  comp2 <- loo_compare(w1, w2)
+  expect_s3_class(comp2, "compare.loo")
+  expect_equal(colnames(comp2), comp_colnames)
+  expect_equal(comp2$p_worse, c(NA, 1))
+  expect_equal(comp2$diag_diff, c("", "N < 100"))
+  expect_equal(comp2$diag_elpd, c("", ""))
+  expect_snapshot_value(comp2, style = "serialize")
+  expect_snapshot(print(comp2))
+  expect_snapshot(print(comp2, p_worse = FALSE))
+  expect_snapshot(print(comp2, simplify = FALSE))
+  expect_snapshot(print(comp2, simplify = FALSE, p_worse = FALSE))
+
+  # specifying objects via ... and via arg x gives equal results
+  expect_equal(comp2, loo_compare(x = list(w1, w2)))
+
+  # custom naming works
+  comp3 <- loo_compare(x = list("A" = w2, "B" = w1))
+  expect_equal(comp3$model, c("B", "A"))
+})
+
+test_that("loo_compare returns expected result (3 models)", {
+  w3 <- suppressWarnings(waic(LLarr3))
+  comp1 <- loo_compare(w1, w2, w3)
+
+  expect_equal(colnames(comp1), comp_colnames)
+  expect_equal(comp1$model, c("model1", "model2", "model3"))
+  expect_equal(comp1$p_worse, c(NA, 1, 1))
+  expect_equal(comp1$diag_diff, c("", "N < 100", "N < 100"))
+  expect_s3_class(comp1, "compare.loo")
+  expect_s3_class(comp1, "data.frame")
+  expect_snapshot_value(comp1, style = "serialize")
+  expect_snapshot(print(comp1))
+
+  # specifying objects via '...' gives equivalent results (equal
+  # except rownames) to using 'x' argument
+  expect_equal(comp1, loo_compare(x = list(w1, w2, w3)), ignore_attr = TRUE)
+})
+
+test_that("loo_compare with simplify=FALSE returns expected result", {
+  LL <- example_loglik_array()
+  loo1 <- loo(LL)
+  loo2 <- loo(LL + 1)
+  loo3 <- loo(LL + 2)
+  comp <- loo_compare(loo1, loo2, loo3)
+  expect_snapshot(print(comp, simplify = FALSE))
+})
+
+# Tests for deprecated compare() ------------------------------------------
+
+test_that("compare throws deprecation warnings", {
+  expect_warning(loo::compare(w1, w2), "Deprecated")
+  expect_warning(loo::compare(w1, w1, w2), "Deprecated")
+})
+
+test_that("compare returns expected result (2 models)", {
+  expect_warning(comp1 <- loo::compare(w1, w1), "Deprecated")
+  expect_equal(comp1[1:2], c(elpd_diff = 0, se = 0))
+
+  expect_warning(comp2 <- loo::compare(w1, w2), "Deprecated")
+  expect_equal(round(comp2[1:2], 3), c(elpd_diff = -4.057, se = 0.088))
+  expect_s3_class(comp2, "old_compare.loo")
+
+  # specifying objects via ... and via arg x gives equal results
+  expect_warning(comp_via_list <- loo::compare(x = list(w1, w2)), "Deprecated")
+  expect_equal(comp2, comp_via_list)
+})
+
+test_that("compare returns expected result (3 models)", {
+  w3 <- suppressWarnings(waic(LLarr3))
+  expect_warning(comp1 <- loo::compare(w1, w2, w3), "Deprecated")
+
+  expect_equal(
+    colnames(comp1),
+    c(
+      "elpd_diff",
+      "se_diff",
+      "elpd_waic",
+      "se_elpd_waic",
+      "p_waic",
+      "se_p_waic",
+      "waic",
+      "se_waic"
+    )
+  )
+  expect_equal(rownames(comp1), c("w1", "w2", "w3"))
+  expect_equal(comp1[1, 1], 0)
+  expect_s3_class(comp1, "compare.loo")
+  expect_s3_class(comp1, "matrix")
+  expect_snapshot_value(comp1, style = "serialize")
+
+  # specifying objects via '...' gives equivalent results (equal
+  # except rownames) to using 'x' argument
+  expect_warning(
+    comp_via_list <- loo::compare(x = list(w1, w2, w3)),
+    "Deprecated"
+  )
+  expect_equal(comp1, comp_via_list, ignore_attr = TRUE)
+})
+
+test_that("compare throws appropriate errors", {
+  expect_error(
+    suppressWarnings(loo::compare(w1, w2, x = list(w1, w2))),
+    "should not be specified"
+  )
+  expect_error(suppressWarnings(loo::compare(x = 2)), "must be a list")
+  expect_error(
+    suppressWarnings(loo::compare(x = list(2))),
+    "should have class 'loo'"
+  )
+  expect_error(
+    suppressWarnings(loo::compare(x = list(w1))),
+    "requires at least two models"
+  )
+
+  w3 <- suppressWarnings(waic(LLarr2[,, -1]))
+  expect_error(
+    suppressWarnings(loo::compare(x = list(w1, w3))),
+    "same number of data points"
+  )
+  expect_error(
+    suppressWarnings(loo::compare(x = list(w1, w2, w3))),
+    "same number of data points"
+  )
+})
