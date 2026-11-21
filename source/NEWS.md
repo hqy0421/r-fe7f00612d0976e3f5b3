@@ -1,5 +1,13 @@
 # loo (development version)
 
+* Add `loo_decision_thresholds()` for cost-optimal three-way decisions
+(approve / review / block) from PSIS-LOO risk probabilities. It takes the
+costs of false approve, false block, and review, plus optional bounds on the
+number of reviews and false blocks, and returns reusable thresholds, band
+counts, and a cost breakdown. Selection is O(n log n), never splits tied
+risks, and prefers fewer reviews on cost ties. The existing binary
+classification metrics are unchanged.
+
 * Handle errors of the user functions in `loo_moment_match()` by @avehtari in #410
 * Allow different numbers of draws in `loo_model_weights()` by @avehtari in #409
 * Improve numerical stability in `loo()`, `psis()`, model weighting, subsampling, 
